@@ -1,0 +1,123 @@
+from flask import Flask, jsonify
+import serial
+import requests
+import threading
+import os
+import json
+import schedule
+from dotenv import load_dotenv
+import time
+
+app = Flask(__name__)
+
+# .env 파일로부터 환경 변수 로드
+load_dotenv()
+
+# 데이터베이스 관련 환경 변수 로드
+db_host = os.getenv("EXPRESS_SERVER_URL")
+
+# 시리얼 통신 관련 환경 변수 로드
+ser_port = os.getenv("SER_PORT")
+ser_baud = os.getenv("SER_BAUD")
+
+# 시리얼 통신 객체 생성
+ser = serial.Serial(ser_port, ser_baud)
+
+SERIAL_DATA = {
+    "patient_id": 101,
+    "oxygen_saturation": 0,
+    "distance_travelled": 0,
+    "temperature": 0,
+    "heart_rate": 0,
+}
+
+
+# ------------------------------  Serial 관련 스레드 모음  --------------------------------------------
+
+# 홀센서 감지 횟수 저장 변수
+hall_sensor_count = 0
+hall_sensor_threshold = 3  # 감지 횟수 임계값
+
+# 시리얼 통신 함수
+def serial_thread():
+    global hall_sensor_count, last_distance_update_time
+    print("시리얼 모니터 수신이 시작되었습니다.")
+    while True:
+            # 시리얼 데이터 읽기
+            try:
+                serial_data = ser.readline().decode('utf-8').strip()
+            except UnicodeDecodeError:
+                print("UnicodeDecodeError: Invalid UTF-8 byte detected. Skipping...")
+                continue
+            
+            # 데이터 확인 및 처리
+            if len(serial_data)>0:
+                # 시리얼 데이터가 JSON 형식인 경우에만 처리
+                try:
+                    # JSON 형식의 데이터를 딕셔너리로 변환
+                    data_dict = json.loads(serial_data)
+
+                    updated = False
+                    for key, value in data_dict.items():
+                        if key in SERIAL_DATA:
+                            if key == "Distance":
+                                hall_sensor_count += 1
+                                if hall_sensor_count >= hall_sensor_threshold:
+                                    value = float(value)  # 문자열을 float으로 변환
+                                    if SERIAL_DATA[key] != value:
+                                        SERIAL_DATA[key] = value
+                                        print(str(SERIAL_DATA[key]) + '로 업데이트')
+                                        updated = True
+                                        print(f"Updated SERIAL_DATA: {key} = {value}")
+                            else:
+                                if SERIAL_DATA[key] != value:
+                                    if isinstance(value, str):
+                                        value = float(value) if '.' in value else int(value)
+                                    SERIAL_DATA[key] = value
+                                    updated = True
+                                    print(f"Updated SERIAL_DATA: {key} = {value}")
+                                    # 새 데이터가 업데이트되면 데이터베이스에 저장
+                        else:
+                            print("Unknown key:", key)
+
+                except ValueError:
+                    print(serial_data)
+                    continue
+
+# ---------------------------------------------------------------------------------------------
+
+@app.route('/biometric', methods=['POST'])
+def save_biometric():
+
+    # Express.js 서버로 POST 요청을 보냄
+    response = requests.post(db_host, json=SERIAL_DATA)
+    
+    # Express.js 서버에서의 응답을 클라이언트에게 전달
+    return jsonify({
+        'status_code': response.status_code,
+        'response_data': response.json()
+    })
+
+# 일정 작업 실행 함수
+def schedule_tasks():
+
+    # 스케줄 작업 설정 (매일 특정 시간에 작업 실행)
+    schedule.every().day.at("23:59:00").do(save_biometric)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+if __name__ == '__main__':
+
+    # 시리얼 통신 스레드 시작
+    serial_thread = threading.Thread(target=serial_thread)
+    serial_thread.daemon = True
+    serial_thread.start()
+
+    # 스케쥴러 스레드 시작
+    scheduler_thread = threading.Thread(target=schedule_tasks)
+    scheduler_thread.daemon = True
+    scheduler_thread.start()
+
+    app.run('0.0.0.0', port=5000, debug=False, threaded=True)
